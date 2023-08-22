@@ -9,6 +9,13 @@ from torch.multiprocessing import Process, Pipe
 import cv2
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
+import logging
+from mlagents_envs.side_channel.engine_configuration_channel import (
+    EngineConfigurationChannel,
+)
+
+channel = EngineConfigurationChannel()
+channel.set_configuration_parameters(time_scale=1.0, capture_frame_rate=60)
 
 
 class VecEnv(ABC):
@@ -69,10 +76,10 @@ class VecEnv(ABC):
         self.step_async(actions)
         return self.step_wait()
 
-    def render(self, mode='human'):
-        #logger.warn('Render not defined for %s' % self)
+    def render(self, mode="human"):
+        # logger.warn('Render not defined for %s' % self)
         pass
-        
+
     @property
     def unwrapped(self):
         if isinstance(self, VecEnvWrapper):
@@ -84,57 +91,66 @@ class VecEnv(ABC):
 def worker(remote, parent_remote, worker_id):
     parent_remote.close()
 
-    env_name="env/RealFinal"
+    env_name = "3actions"
 
     seed = np.random.randint(100000000)
 
-    env = UnityEnvironment(env_name, seed=seed, worker_id=worker_id)
+    env = UnityEnvironment(
+        env_name, seed=seed, side_channels=[channel], worker_id=worker_id
+    )
     env.reset()
     behavior_name = list(env.behavior_specs.keys())[0]
-
+    is_done = False
+    obs, reward, done = None, None, None
     while True:
-        t = remote.recv()
-        cmd = t[0]
-        if cmd == 'step':
-            act0, act1 = t[1][0], t[1][1]
-            #act = t[1].item()
-            action_tuple0 = ActionTuple(np.array([[]], dtype=np.float32), np.array([[act0]], dtype=np.int32))
-            action_tuple1 = ActionTuple(np.array([[]], dtype=np.float32), np.array([[act1]], dtype=np.int32))
-    
-            env.set_action_for_agent(behavior_name, 0, action_tuple0)
-            env.set_action_for_agent(behavior_name, 1, action_tuple1)
-
-            env.step()
-            
-            decision_steps = env.get_steps(behavior_name)
-            
-            if len(decision_steps[1].reward):
-                done = True
-                decision_steps = decision_steps[1]
-            else:
-                done = False
-                decision_steps = decision_steps[0]
-
+        cmd, data = remote.recv()
+        if cmd == "step":
             try:
-                obs0 = decision_steps.obs[0][0]
-                obs0 = cv2.resize(obs0, dsize=(64, 64))
-                obs0 = torch.FloatTensor(obs0)
-                obs0 = obs0.permute(2, 0, 1)
+                if is_done:
+                    return np.zeros(256, 256, 3)
+                data = data.item()
+                assert data in np.arange(9)
 
-                obs1 = decision_steps.obs[0][1]
-                obs1 = cv2.resize(obs1, dsize=(64, 64))
-                obs1 = torch.FloatTensor(obs1)
-                obs1 = obs1.permute(2, 0, 1)
+                action_tuple0 = ActionTuple(
+                    np.array([[]], dtype=np.float32),
+                    np.array([[data // 3 + 1]], dtype=np.int32),
+                )
+                action_tuple1 = ActionTuple(
+                    np.array([[]], dtype=np.float32),
+                    np.array([[data % 3 + 1]], dtype=np.int32),
+                )
+
+                env.set_action_for_agent(behavior_name, 0, action_tuple0)
+                env.set_action_for_agent(behavior_name, 1, action_tuple1)
+
+                env.step()
+
+                decision_steps = env.get_steps(behavior_name)
+                if len(decision_steps[1].reward):
+                    done = True
+                    decision_steps = decision_steps[1]
+                else:
+                    done = False
+                    decision_steps = decision_steps[0]
+
+                obs = decision_steps.obs[0][0]
+                obs = cv2.resize(obs, dsize=(64, 64))
+                obs = torch.FloatTensor(obs)
+                obs = obs.permute(2, 0, 1)
+                reward = decision_steps.reward[0]
+                logging.error(reward)
+
+                remote.send((obs, reward, done))
             except:
-                continue
+                print("error", data)
+                env.reset()
+                remote.send((obs, reward, done))
 
-            reward = decision_steps.reward[0]
-            remote.send((obs0, obs1, reward, done))
-        elif cmd == 'reset':
+        elif cmd == "reset":
             env.reset()
             remote.send(None)
 
-        elif cmd == 'close':
+        elif cmd == "close":
             remote.close()
             break
         else:
@@ -151,9 +167,16 @@ class ParallelEnv(VecEnv):
         self.waiting = False
         self.closed = False
         self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(n)])
-        self.ps = [Process(target=worker, args=(work_remote, remote, worker_id)) for worker_id, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes))]
+        self.ps = [
+            Process(target=worker, args=(work_remote, remote, worker_id))
+            for worker_id, (work_remote, remote) in enumerate(
+                zip(self.work_remotes, self.remotes)
+            )
+        ]
         for p in self.ps:
-            p.daemon = True # if the main process crashes, we should not cause things to hang
+            p.daemon = (
+                True  # if the main process crashes, we should not cause things to hang
+            )
             p.start()
         for remote in self.work_remotes:
             remote.close()
@@ -162,45 +185,44 @@ class ParallelEnv(VecEnv):
 
     def step_async(self, actions):
         for remote, action in zip(self.remotes, actions):
-            remote.send(('step', action))
+            remote.send(("step", action))
         self.waiting = True
 
     def step_wait(self):
         results = [remote.recv() for remote in self.remotes]
         self.waiting = False
-        obs0, obs1,  rews, dones = zip(*results)
-        return np.stack(obs0), np.stack(obs1),  np.stack(rews), np.stack(dones)
+        obs, rews, dones = zip(*results)
+        return np.stack(obs), np.stack(rews), np.stack(dones)
 
     def reset(self):
         for remote in self.remotes:
-            remote.send(('reset', None))
+            remote.send(("reset", None))
         return np.stack([remote.recv() for remote in self.remotes])
 
     def close(self):
         if self.closed:
             return
         if self.waiting:
-            for remote in self.remotes:            
+            for remote in self.remotes:
                 remote.recv()
         for remote in self.remotes:
-            remote.send(('close', None))
+            remote.send(("close", None))
         for p in self.ps:
             p.join()
         self.closed = True
+
 
 def rollout(num_envs, num_steps):
     envs = ParallelEnv(num_envs)
     rewards_total = []
 
-    print("rollout")
     envs.reset()
 
     for epoch in range(3):
-
         epoch_rewards = []
         for _ in range(num_steps):
             actions = torch.randint(0, 7, size=(num_envs,))
-            next_states0, next_states1, step_rewards, dones = envs.step(actions)
+            next_states, step_rewards, dones = envs.step(actions)
             epoch_rewards.append(step_rewards)
             if np.any(dones):
                 assert np.all(dones)
@@ -213,7 +235,7 @@ def rollout(num_envs, num_steps):
     return rewards_total
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     num_envs = 4
     num_steps = 100
 
